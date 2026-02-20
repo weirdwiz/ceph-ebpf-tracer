@@ -2,12 +2,13 @@ package collector
 
 import (
 	"encoding/binary"
-	"fmt"
 	"net"
 
 	"github.com/cilium/ebpf"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/klog/v2"
+
+	"github.com/weirdwiz/ceph-ebpf-tracer/pkg/resolver"
 )
 
 // BPF map types for network tracing -- must match C structs.
@@ -29,9 +30,28 @@ type connStats struct {
 	LastSndWnd  uint32
 }
 
-// NetCollector exports per-connection Ceph network metrics.
+// pairKey identifies a unique source/dest daemon pair for aggregation.
+type pairKey struct {
+	srcType, srcID string
+	dstType, dstID string
+}
+
+// pairStats aggregates stats across multiple TCP connections between the same daemon pair.
+type pairStats struct {
+	srttSumUS   uint64
+	srttCount   uint64
+	srttMinUS   uint32
+	srttMaxUS   uint32
+	retransmits uint64
+	bytesSent   uint64
+	maxCwnd     uint32
+}
+
+// NetCollector exports per-daemon-pair Ceph network metrics,
+// filtered to only known Ceph daemon connections.
 type NetCollector struct {
 	connMap  *ebpf.Map
+	resolver *resolver.Resolver
 	nodeName string
 
 	rttAvg      *prometheus.Desc
@@ -42,40 +62,41 @@ type NetCollector struct {
 	cwnd        *prometheus.Desc
 }
 
-func NewNetCollector(connMap *ebpf.Map, nodeName string) *NetCollector {
-	labels := []string{"source", "source_port", "peer", "port", "node"}
+func NewNetCollector(connMap *ebpf.Map, res *resolver.Resolver, nodeName string) *NetCollector {
+	labels := []string{"source_type", "source_id", "dest_type", "dest_id", "node"}
 
 	return &NetCollector{
 		connMap:  connMap,
+		resolver: res,
 		nodeName: nodeName,
 		rttAvg: prometheus.NewDesc(
 			"ceph_ebpf_network_rtt_seconds",
-			"Average TCP smoothed RTT per Ceph connection in seconds",
+			"Weighted average TCP smoothed RTT per Ceph daemon pair in seconds",
 			labels, nil,
 		),
 		rttMin: prometheus.NewDesc(
 			"ceph_ebpf_network_rtt_min_seconds",
-			"Minimum observed TCP RTT per Ceph connection in seconds",
+			"Minimum observed TCP RTT per Ceph daemon pair in seconds",
 			labels, nil,
 		),
 		rttMax: prometheus.NewDesc(
 			"ceph_ebpf_network_rtt_max_seconds",
-			"Maximum observed TCP RTT per Ceph connection in seconds",
+			"Maximum observed TCP RTT per Ceph daemon pair in seconds",
 			labels, nil,
 		),
 		retransmits: prometheus.NewDesc(
 			"ceph_ebpf_network_retransmits_total",
-			"Total TCP retransmissions per Ceph connection",
+			"Total TCP retransmissions per Ceph daemon pair",
 			labels, nil,
 		),
 		bytesSent: prometheus.NewDesc(
 			"ceph_ebpf_network_bytes_sent_total",
-			"Total bytes sent per Ceph connection",
+			"Total bytes sent per Ceph daemon pair",
 			labels, nil,
 		),
 		cwnd: prometheus.NewDesc(
 			"ceph_ebpf_network_cwnd",
-			"Current TCP congestion window per Ceph connection (in segments)",
+			"Maximum TCP congestion window across connections to Ceph daemon pair (segments)",
 			labels, nil,
 		),
 	}
@@ -94,52 +115,94 @@ func (c *NetCollector) Collect(ch chan<- prometheus.Metric) {
 	var key connKey
 	var stats connStats
 
+	// First pass: aggregate per daemon pair.
+	pairs := make(map[pairKey]*pairStats)
+
 	iter := c.connMap.Iterate()
 	for iter.Next(&key, &stats) {
-		source := ipv4String(key.Saddr)
-		sourcePort := fmt.Sprintf("%d", key.Sport)
-		peer := ipv4String(key.Daddr)
-		port := fmt.Sprintf("%d", key.Dport)
+		srcIP := ipv4String(key.Saddr)
+		dstIP := ipv4String(key.Daddr)
 
-		if stats.SrttCount > 0 {
-			avgRttSec := float64(stats.SrttSumUS) / float64(stats.SrttCount) / 1e6
-			ch <- prometheus.MustNewConstMetric(
-				c.rttAvg, prometheus.GaugeValue, avgRttSec,
-				source, sourcePort, peer, port, c.nodeName,
-			)
+		srcInfo := c.resolver.Lookup(srcIP)
+		dstInfo := c.resolver.Lookup(dstIP)
+
+		if srcInfo == nil && dstInfo == nil {
+			continue
 		}
 
-		if stats.SrttMinUS > 0 {
-			ch <- prometheus.MustNewConstMetric(
-				c.rttMin, prometheus.GaugeValue, float64(stats.SrttMinUS)/1e6,
-				source, sourcePort, peer, port, c.nodeName,
-			)
+		pk := pairKey{srcType: "client", srcID: "client", dstType: "client", dstID: "client"}
+		if srcInfo != nil {
+			pk.srcType = srcInfo.Role
+			pk.srcID = srcInfo.DaemonID
+		}
+		if dstInfo != nil {
+			pk.dstType = dstInfo.Role
+			pk.dstID = dstInfo.DaemonID
 		}
 
-		if stats.SrttMaxUS > 0 {
-			ch <- prometheus.MustNewConstMetric(
-				c.rttMax, prometheus.GaugeValue, float64(stats.SrttMaxUS)/1e6,
-				source, sourcePort, peer, port, c.nodeName,
-			)
+		ps, ok := pairs[pk]
+		if !ok {
+			ps = &pairStats{srttMinUS: stats.SrttMinUS}
+			pairs[pk] = ps
 		}
 
-		ch <- prometheus.MustNewConstMetric(
-			c.retransmits, prometheus.CounterValue, float64(stats.Retransmits),
-			source, sourcePort, peer, port, c.nodeName,
-		)
+		ps.srttSumUS += stats.SrttSumUS
+		ps.srttCount += stats.SrttCount
+		ps.retransmits += stats.Retransmits
+		ps.bytesSent += stats.BytesSent
 
-		ch <- prometheus.MustNewConstMetric(
-			c.bytesSent, prometheus.CounterValue, float64(stats.BytesSent),
-			source, sourcePort, peer, port, c.nodeName,
-		)
-
-		ch <- prometheus.MustNewConstMetric(
-			c.cwnd, prometheus.GaugeValue, float64(stats.LastCwnd),
-			source, sourcePort, peer, port, c.nodeName,
-		)
+		if stats.SrttMinUS > 0 && (stats.SrttMinUS < ps.srttMinUS || ps.srttMinUS == 0) {
+			ps.srttMinUS = stats.SrttMinUS
+		}
+		if stats.SrttMaxUS > ps.srttMaxUS {
+			ps.srttMaxUS = stats.SrttMaxUS
+		}
+		if stats.LastCwnd > ps.maxCwnd {
+			ps.maxCwnd = stats.LastCwnd
+		}
 	}
 	if err := iter.Err(); err != nil {
 		klog.Warningf("iterating ceph_conn_stats map: %v", err)
+	}
+
+	// Second pass: emit one metric set per daemon pair.
+	for pk, ps := range pairs {
+		if ps.srttCount > 0 {
+			avgRttSec := float64(ps.srttSumUS) / float64(ps.srttCount) / 1e6
+			ch <- prometheus.MustNewConstMetric(
+				c.rttAvg, prometheus.GaugeValue, avgRttSec,
+				pk.srcType, pk.srcID, pk.dstType, pk.dstID, c.nodeName,
+			)
+		}
+
+		if ps.srttMinUS > 0 {
+			ch <- prometheus.MustNewConstMetric(
+				c.rttMin, prometheus.GaugeValue, float64(ps.srttMinUS)/1e6,
+				pk.srcType, pk.srcID, pk.dstType, pk.dstID, c.nodeName,
+			)
+		}
+
+		if ps.srttMaxUS > 0 {
+			ch <- prometheus.MustNewConstMetric(
+				c.rttMax, prometheus.GaugeValue, float64(ps.srttMaxUS)/1e6,
+				pk.srcType, pk.srcID, pk.dstType, pk.dstID, c.nodeName,
+			)
+		}
+
+		ch <- prometheus.MustNewConstMetric(
+			c.retransmits, prometheus.CounterValue, float64(ps.retransmits),
+			pk.srcType, pk.srcID, pk.dstType, pk.dstID, c.nodeName,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			c.bytesSent, prometheus.CounterValue, float64(ps.bytesSent),
+			pk.srcType, pk.srcID, pk.dstType, pk.dstID, c.nodeName,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			c.cwnd, prometheus.GaugeValue, float64(ps.maxCwnd),
+			pk.srcType, pk.srcID, pk.dstType, pk.dstID, c.nodeName,
+		)
 	}
 }
 

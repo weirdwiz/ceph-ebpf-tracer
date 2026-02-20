@@ -21,6 +21,7 @@ import (
 	"github.com/weirdwiz/ceph-ebpf-tracer/pkg/collector"
 	"github.com/weirdwiz/ceph-ebpf-tracer/pkg/correlator"
 	"github.com/weirdwiz/ceph-ebpf-tracer/pkg/device"
+	"github.com/weirdwiz/ceph-ebpf-tracer/pkg/resolver"
 )
 
 func main() {
@@ -91,6 +92,10 @@ func main() {
 	cor := correlator.New(k8sClient)
 	cor.Run(ctx)
 
+	// Set up Ceph daemon resolver for network metric filtering
+	res := resolver.New(k8sClient, "openshift-storage")
+	res.Run(ctx)
+
 	// Load and attach network tracer
 	netTracer, err := bpfpkg.NewNetTracer()
 	if err != nil {
@@ -108,7 +113,7 @@ func main() {
 	prometheus.MustRegister(col)
 
 	netMaps := netTracer.Maps()
-	netCol := collector.NewNetCollector(netMaps.CephConnStats, nodeName)
+	netCol := collector.NewNetCollector(netMaps.CephConnStats, res, nodeName)
 	prometheus.MustRegister(netCol)
 
 	// Serve metrics
