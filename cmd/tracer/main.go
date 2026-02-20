@@ -5,8 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -35,6 +37,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Resolve node name once for all collectors
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName == "" {
+		nodeName, _ = os.Hostname()
+	}
+
 	// Discover RBD major number
 	rbdMajor, err := device.DiscoverRBDMajor()
 	if err != nil {
@@ -53,11 +61,25 @@ func main() {
 		klog.Fatalf("attaching BPF: %v", err)
 	}
 
-	// Set up device watcher
+	// Set up device watcher with background scanning
 	dw := device.NewWatcher()
 	if err := dw.Scan(); err != nil {
 		klog.Warningf("initial device scan: %v", err)
 	}
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := dw.Scan(); err != nil {
+					klog.V(2).Infof("periodic device scan: %v", err)
+				}
+			}
+		}
+	}()
 
 	// Set up Kubernetes client
 	k8sClient, err := buildK8sClient(kubeconfig)
@@ -82,11 +104,11 @@ func main() {
 
 	// Set up Prometheus collectors
 	maps := tracer.Maps()
-	col := collector.New(dw, cor, maps.IoLatency, maps.IoThroughput, maps.IoSizeDist, maps.IoQueueDepth)
+	col := collector.New(dw, cor, nodeName, maps.IoLatency, maps.IoThroughput, maps.IoSizeDist, maps.IoQueueDepth)
 	prometheus.MustRegister(col)
 
 	netMaps := netTracer.Maps()
-	netCol := collector.NewNetCollector(netMaps.CephConnStats)
+	netCol := collector.NewNetCollector(netMaps.CephConnStats, nodeName)
 	prometheus.MustRegister(netCol)
 
 	// Serve metrics
@@ -108,7 +130,12 @@ func main() {
 
 	<-ctx.Done()
 	klog.Info("shutting down")
-	server.Close()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		klog.Errorf("HTTP server shutdown: %v", err)
+	}
 }
 
 func buildK8sClient(kubeconfig string) (kubernetes.Interface, error) {

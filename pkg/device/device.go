@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	sysRBDPath = "/sys/devices/rbd"
+	sysRBDPath  = "/sys/devices/rbd"
 	procDevices = "/proc/devices"
 )
 
@@ -132,13 +132,19 @@ func (w *Watcher) readDevice(id string) (*RBDDevice, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading major: %w", err)
 	}
-	major, _ := strconv.ParseUint(majorStr, 10, 32)
+	major, err := strconv.ParseUint(majorStr, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("parsing major %q: %w", majorStr, err)
+	}
 
 	minorStr, err := readSysfs(filepath.Join(base, "minor"))
 	if err != nil {
 		return nil, fmt.Errorf("reading minor: %w", err)
 	}
-	minor, _ := strconv.ParseUint(minorStr, 10, 32)
+	minor, err := strconv.ParseUint(minorStr, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("parsing minor %q: %w", minorStr, err)
+	}
 
 	poolNS, _ := readSysfs(filepath.Join(base, "pool_ns"))
 

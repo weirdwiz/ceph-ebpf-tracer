@@ -4,82 +4,78 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"os"
 
 	"github.com/cilium/ebpf"
 	"github.com/prometheus/client_golang/prometheus"
+	"k8s.io/klog/v2"
 )
 
 // BPF map types for network tracing -- must match C structs.
 type connKey struct {
+	Saddr uint32
 	Daddr uint32
+	Sport uint16
 	Dport uint16
-	Pad   uint16
 }
 
 type connStats struct {
-	SrttSumUS  uint64
-	SrttCount  uint64
-	SrttMinUS  uint32
-	SrttMaxUS  uint32
+	SrttSumUS   uint64
+	SrttCount   uint64
+	SrttMinUS   uint32
+	SrttMaxUS   uint32
 	Retransmits uint64
-	BytesSent  uint64
-	LastCwnd   uint32
-	LastSndWnd uint32
+	BytesSent   uint64
+	LastCwnd    uint32
+	LastSndWnd  uint32
 }
 
-// NetCollector exports per-OSD Ceph network metrics.
+// NetCollector exports per-connection Ceph network metrics.
 type NetCollector struct {
 	connMap  *ebpf.Map
 	nodeName string
 
-	rttAvg       *prometheus.Desc
-	rttMin       *prometheus.Desc
-	rttMax       *prometheus.Desc
-	retransmits  *prometheus.Desc
-	bytesSent    *prometheus.Desc
-	cwnd         *prometheus.Desc
+	rttAvg      *prometheus.Desc
+	rttMin      *prometheus.Desc
+	rttMax      *prometheus.Desc
+	retransmits *prometheus.Desc
+	bytesSent   *prometheus.Desc
+	cwnd        *prometheus.Desc
 }
 
-func NewNetCollector(connMap *ebpf.Map) *NetCollector {
-	nodeName := os.Getenv("NODE_NAME")
-	if nodeName == "" {
-		nodeName, _ = os.Hostname()
-	}
-
-	labels := []string{"peer", "port", "node"}
+func NewNetCollector(connMap *ebpf.Map, nodeName string) *NetCollector {
+	labels := []string{"source", "source_port", "peer", "port", "node"}
 
 	return &NetCollector{
 		connMap:  connMap,
 		nodeName: nodeName,
 		rttAvg: prometheus.NewDesc(
 			"ceph_ebpf_network_rtt_seconds",
-			"Average TCP smoothed RTT to Ceph OSD/MON peer in seconds",
+			"Average TCP smoothed RTT per Ceph connection in seconds",
 			labels, nil,
 		),
 		rttMin: prometheus.NewDesc(
 			"ceph_ebpf_network_rtt_min_seconds",
-			"Minimum observed TCP RTT to Ceph peer in seconds",
+			"Minimum observed TCP RTT per Ceph connection in seconds",
 			labels, nil,
 		),
 		rttMax: prometheus.NewDesc(
 			"ceph_ebpf_network_rtt_max_seconds",
-			"Maximum observed TCP RTT to Ceph peer in seconds",
+			"Maximum observed TCP RTT per Ceph connection in seconds",
 			labels, nil,
 		),
 		retransmits: prometheus.NewDesc(
 			"ceph_ebpf_network_retransmits_total",
-			"Total TCP retransmissions to Ceph peer",
+			"Total TCP retransmissions per Ceph connection",
 			labels, nil,
 		),
 		bytesSent: prometheus.NewDesc(
 			"ceph_ebpf_network_bytes_sent_total",
-			"Total bytes sent to Ceph peer",
+			"Total bytes sent per Ceph connection",
 			labels, nil,
 		),
 		cwnd: prometheus.NewDesc(
 			"ceph_ebpf_network_cwnd",
-			"Current TCP congestion window to Ceph peer (in segments)",
+			"Current TCP congestion window per Ceph connection (in segments)",
 			labels, nil,
 		),
 	}
@@ -100,6 +96,8 @@ func (c *NetCollector) Collect(ch chan<- prometheus.Metric) {
 
 	iter := c.connMap.Iterate()
 	for iter.Next(&key, &stats) {
+		source := ipv4String(key.Saddr)
+		sourcePort := fmt.Sprintf("%d", key.Sport)
 		peer := ipv4String(key.Daddr)
 		port := fmt.Sprintf("%d", key.Dport)
 
@@ -107,43 +105,46 @@ func (c *NetCollector) Collect(ch chan<- prometheus.Metric) {
 			avgRttSec := float64(stats.SrttSumUS) / float64(stats.SrttCount) / 1e6
 			ch <- prometheus.MustNewConstMetric(
 				c.rttAvg, prometheus.GaugeValue, avgRttSec,
-				peer, port, c.nodeName,
+				source, sourcePort, peer, port, c.nodeName,
 			)
 		}
 
 		if stats.SrttMinUS > 0 {
 			ch <- prometheus.MustNewConstMetric(
 				c.rttMin, prometheus.GaugeValue, float64(stats.SrttMinUS)/1e6,
-				peer, port, c.nodeName,
+				source, sourcePort, peer, port, c.nodeName,
 			)
 		}
 
 		if stats.SrttMaxUS > 0 {
 			ch <- prometheus.MustNewConstMetric(
 				c.rttMax, prometheus.GaugeValue, float64(stats.SrttMaxUS)/1e6,
-				peer, port, c.nodeName,
+				source, sourcePort, peer, port, c.nodeName,
 			)
 		}
 
 		ch <- prometheus.MustNewConstMetric(
 			c.retransmits, prometheus.CounterValue, float64(stats.Retransmits),
-			peer, port, c.nodeName,
+			source, sourcePort, peer, port, c.nodeName,
 		)
 
 		ch <- prometheus.MustNewConstMetric(
 			c.bytesSent, prometheus.CounterValue, float64(stats.BytesSent),
-			peer, port, c.nodeName,
+			source, sourcePort, peer, port, c.nodeName,
 		)
 
 		ch <- prometheus.MustNewConstMetric(
 			c.cwnd, prometheus.GaugeValue, float64(stats.LastCwnd),
-			peer, port, c.nodeName,
+			source, sourcePort, peer, port, c.nodeName,
 		)
+	}
+	if err := iter.Err(); err != nil {
+		klog.Warningf("iterating ceph_conn_stats map: %v", err)
 	}
 }
 
 func ipv4String(addr uint32) string {
 	ip := make(net.IP, 4)
-	binary.LittleEndian.PutUint32(ip, addr)
+	binary.NativeEndian.PutUint32(ip, addr)
 	return ip.String()
 }

@@ -1,9 +1,6 @@
 package collector
 
 import (
-	"os"
-	"sync"
-
 	"github.com/cilium/ebpf"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/klog/v2"
@@ -16,8 +13,8 @@ const (
 	opRead  = 0
 	opWrite = 1
 
-	log2BucketCount    = 32
-	iosizeBucketCount  = 16
+	log2BucketCount   = 32
+	iosizeBucketCount = 16
 )
 
 // BPF map key/value types -- must match the C structs exactly.
@@ -44,8 +41,10 @@ type ioStats struct {
 }
 
 type iosizeHist struct {
-	ReadBuckets  [iosizeBucketCount]uint64
-	WriteBuckets [iosizeBucketCount]uint64
+	ReadBuckets   [iosizeBucketCount]uint64
+	WriteBuckets  [iosizeBucketCount]uint64
+	ReadSumBytes  uint64
+	WriteSumBytes uint64
 }
 
 type queueDepth struct {
@@ -62,29 +61,23 @@ type Collector struct {
 	queueMap      *ebpf.Map
 	nodeName      string
 
-	ioLatency      *prometheus.Desc
-	ioBytesTotal   *prometheus.Desc
-	ioOpsTotal     *prometheus.Desc
-	ioQueueDepth   *prometheus.Desc
-	ioErrorsTotal  *prometheus.Desc
-	ioSizeDist     *prometheus.Desc
-
-	mu sync.Mutex
+	ioLatency     *prometheus.Desc
+	ioBytesTotal  *prometheus.Desc
+	ioOpsTotal    *prometheus.Desc
+	ioQueueDepth  *prometheus.Desc
+	ioErrorsTotal *prometheus.Desc
+	ioSizeDist    *prometheus.Desc
 }
 
 func New(
 	dw *device.Watcher,
 	cor *correlator.Correlator,
+	nodeName string,
 	latencyMap *ebpf.Map,
 	throughputMap *ebpf.Map,
 	iosizeMap *ebpf.Map,
 	queueMap *ebpf.Map,
 ) *Collector {
-	nodeName := os.Getenv("NODE_NAME")
-	if nodeName == "" {
-		nodeName, _ = os.Hostname()
-	}
-
 	pvcLabels := []string{"pvc", "namespace", "pool", "node"}
 	pvcOpLabels := []string{"pvc", "namespace", "pool", "node", "operation"}
 
@@ -140,13 +133,6 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if err := c.deviceWatcher.Scan(); err != nil {
-		klog.V(2).Infof("device scan: %v", err)
-	}
-
 	devices := c.deviceWatcher.GetDevices()
 
 	c.collectLatency(ch, devices)
@@ -195,10 +181,15 @@ func (c *Collector) collectLatency(ch chan<- prometheus.Metric, devices map[uint
 			pvc.PVCName, pvc.PVCNamespace, pvc.Pool, c.nodeName, opStr,
 		)
 	}
+	if err := iter.Err(); err != nil {
+		klog.Warningf("iterating io_latency map: %v", err)
+	}
 }
 
 func (c *Collector) collectThroughput(ch chan<- prometheus.Metric, devices map[uint32]*device.RBDDevice) {
 	var key devOpKey
+	// io_throughput is a BPF_MAP_TYPE_PERCPU_HASH. cilium/ebpf's Iterate().Next()
+	// populates a slice with one ioStats value per CPU when the value arg is a slice type.
 	var values []ioStats
 
 	iter := c.throughputMap.Iterate()
@@ -224,6 +215,9 @@ func (c *Collector) collectThroughput(ch chan<- prometheus.Metric, devices map[u
 			c.ioOpsTotal, prometheus.CounterValue, float64(totalOps),
 			pvc.PVCName, pvc.PVCNamespace, pvc.Pool, c.nodeName, opStr,
 		)
+	}
+	if err := iter.Err(); err != nil {
+		klog.Warningf("iterating io_throughput map: %v", err)
 	}
 }
 
@@ -252,6 +246,9 @@ func (c *Collector) collectQueueDepth(ch chan<- prometheus.Metric, devices map[u
 			pvc.PVCName, pvc.PVCNamespace, pvc.Pool, c.nodeName,
 		)
 	}
+	if err := iter.Err(); err != nil {
+		klog.Warningf("iterating io_queue_depth map: %v", err)
+	}
 }
 
 func (c *Collector) collectIOSizeDist(ch chan<- prometheus.Metric, devices map[uint32]*device.RBDDevice) {
@@ -267,37 +264,38 @@ func (c *Collector) collectIOSizeDist(ch chan<- prometheus.Metric, devices map[u
 
 		// Read I/O size histogram
 		readBuckets := make(map[float64]uint64)
-		var readCum, readTotal uint64
+		var readTotal uint64
 		for i := 0; i < iosizeBucketCount; i++ {
-			readCum += sh.ReadBuckets[i]
 			readTotal += sh.ReadBuckets[i]
 			upperBytes := float64(uint64(1) << uint(i+1))
-			readBuckets[upperBytes] = readCum
+			readBuckets[upperBytes] = readTotal
 		}
 		if readTotal > 0 {
 			ch <- prometheus.MustNewConstHistogram(
 				c.ioSizeDist,
-				readTotal, 0, readBuckets,
+				readTotal, float64(sh.ReadSumBytes), readBuckets,
 				pvc.PVCName, pvc.PVCNamespace, pvc.Pool, c.nodeName, "read",
 			)
 		}
 
 		// Write I/O size histogram
 		writeBuckets := make(map[float64]uint64)
-		var writeCum, writeTotal uint64
+		var writeTotal uint64
 		for i := 0; i < iosizeBucketCount; i++ {
-			writeCum += sh.WriteBuckets[i]
 			writeTotal += sh.WriteBuckets[i]
 			upperBytes := float64(uint64(1) << uint(i+1))
-			writeBuckets[upperBytes] = writeCum
+			writeBuckets[upperBytes] = writeTotal
 		}
 		if writeTotal > 0 {
 			ch <- prometheus.MustNewConstHistogram(
 				c.ioSizeDist,
-				writeTotal, 0, writeBuckets,
+				writeTotal, float64(sh.WriteSumBytes), writeBuckets,
 				pvc.PVCName, pvc.PVCNamespace, pvc.Pool, c.nodeName, "write",
 			)
 		}
+	}
+	if err := iter.Err(); err != nil {
+		klog.Warningf("iterating io_size_dist map: %v", err)
 	}
 }
 

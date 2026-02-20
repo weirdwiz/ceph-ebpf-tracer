@@ -15,11 +15,12 @@
 #define CEPH_MON_PORT 6789
 #define CEPH_MSGR2_PORT 3300
 
-// Connection key: destination IP + port identifies an OSD/MON
+// Connection key: source/destination tuple identifies a TCP connection
 struct conn_key {
+	__u32 saddr;     // source IPv4 address
 	__u32 daddr;     // destination IPv4 address
+	__u16 sport;     // source port
 	__u16 dport;     // destination port
-	__u16 __pad;
 };
 
 // Per-connection stats
@@ -49,8 +50,10 @@ static __always_inline int is_ceph_port(__u16 port) {
 		(port >= 6800 && port <= CEPH_PORT_MAX));
 }
 
-// tcp_probe tracepoint context
-// From /sys/kernel/debug/tracing/events/tcp/tcp_probe/format
+// tcp_probe tracepoint context.
+// Struct layout MUST match /sys/kernel/debug/tracing/events/tcp/tcp_probe/format
+// on the target kernel. Verify with: cat /sys/kernel/debug/tracing/events/tcp/tcp_probe/format
+// Validated against RHEL 9 / kernel 5.14+.
 struct tcp_probe_args {
 	__u16 common_type;
 	__u8  common_flags;
@@ -78,7 +81,9 @@ struct tcp_probe_args {
 	__u64 sock_cookie;   // offset 112
 };
 
-// tcp_retransmit_skb tracepoint context
+// tcp_retransmit_skb tracepoint context.
+// Verify layout: cat /sys/kernel/debug/tracing/events/tcp/tcp_retransmit_skb/format
+// Validated against RHEL 9 / kernel 5.14+.
 struct tcp_retransmit_args {
 	__u16 common_type;
 	__u8  common_flags;
@@ -107,11 +112,13 @@ int trace_tcp_probe(struct tcp_probe_args *ctx) {
 	if (!is_ceph_port(dport))
 		return 0;
 
-	// Extract IPv4 dest address from sockaddr_in6
+	// Extract IPv4 src/dst addresses from sockaddr_in6
 	// For AF_INET, the IPv4 address is at offset 4 in the sockaddr_in structure
 	// sockaddr_in: family(2) + port(2) + addr(4)
+	__u32 saddr = 0;
 	__u32 daddr = 0;
 	if (ctx->family == 2) { // AF_INET
+		saddr = *(__u32 *)&ctx->saddr[4];
 		// daddr field contains sockaddr_in6 but for IPv4, address is at bytes 4-7
 		daddr = *(__u32 *)&ctx->daddr[4];
 	} else {
@@ -120,7 +127,9 @@ int trace_tcp_probe(struct tcp_probe_args *ctx) {
 
 	struct conn_key key;
 	__builtin_memset(&key, 0, sizeof(key));
+	key.saddr = saddr;
 	key.daddr = daddr;
+	key.sport = ctx->sport;
 	key.dport = dport;
 
 	__u32 srtt = ctx->srtt; // already in microseconds
@@ -131,7 +140,9 @@ int trace_tcp_probe(struct tcp_probe_args *ctx) {
 		__sync_fetch_and_add(&stats->srtt_count, 1);
 		__sync_fetch_and_add(&stats->bytes_sent, ctx->data_len);
 
-		// Update min/max (racy but acceptable for monitoring)
+		// Non-atomic min/max update. Concurrent CPUs can race here, but for
+		// monitoring purposes the values converge quickly and occasional
+		// staleness is acceptable. CAS (BPF_CMPXCHG) requires LLVM 15+.
 		if (srtt < stats->srtt_min_us || stats->srtt_min_us == 0)
 			stats->srtt_min_us = srtt;
 		if (srtt > stats->srtt_max_us)
@@ -165,11 +176,14 @@ int trace_tcp_retransmit(struct tcp_retransmit_args *ctx) {
 	if (ctx->family != 2) // AF_INET only
 		return 0;
 
+	__u32 saddr = *(__u32 *)ctx->saddr;
 	__u32 daddr = *(__u32 *)ctx->daddr;
 
 	struct conn_key key;
 	__builtin_memset(&key, 0, sizeof(key));
+	key.saddr = saddr;
 	key.daddr = daddr;
+	key.sport = ctx->sport;
 	key.dport = dport;
 
 	struct conn_stats *stats = bpf_map_lookup_elem(&ceph_conn_stats, &key);

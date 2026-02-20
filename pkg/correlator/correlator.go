@@ -24,10 +24,10 @@ type PVCInfo struct {
 
 // Correlator maps RBD image names to PVC identities by watching PV objects.
 type Correlator struct {
-	mu       sync.RWMutex
-	byImage  map[string]*PVCInfo // keyed by imageName (e.g., "csi-vol-xxx")
-	client   kubernetes.Interface
-	stopCh   chan struct{}
+	mu      sync.RWMutex
+	byImage map[string]*PVCInfo // keyed by imageName (e.g., "csi-vol-xxx")
+	client  kubernetes.Interface
+	stopCh  chan struct{}
 }
 
 func New(client kubernetes.Interface) *Correlator {
@@ -38,8 +38,9 @@ func New(client kubernetes.Interface) *Correlator {
 	}
 }
 
-// Run starts watching PersistentVolumes and populating the image->PVC map.
-// It blocks until ctx is cancelled.
+// Run performs an initial PV sync, then starts a background goroutine
+// that watches PersistentVolumes and keeps the image->PVC map up to date.
+// The background goroutine stops when ctx is cancelled.
 func (c *Correlator) Run(ctx context.Context) {
 	// Initial list
 	if err := c.syncAll(ctx); err != nil {
@@ -122,7 +123,7 @@ func (c *Correlator) processPV(pv *corev1.PersistentVolume) {
 		return
 	}
 
-	if !strings.Contains(pv.Spec.CSI.Driver, ".rbd.csi.ceph.com") {
+	if !strings.HasSuffix(pv.Spec.CSI.Driver, "rbd.csi.ceph.com") {
 		return
 	}
 

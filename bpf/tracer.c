@@ -13,6 +13,7 @@
 
 #define OP_READ  0
 #define OP_WRITE 1
+#define OP_OTHER 0xFF
 
 #define MAX_LATENCY_NS (30ULL * 1000000000ULL)
 
@@ -54,6 +55,8 @@ struct io_stats {
 struct iosize_hist {
 	__u64 read_buckets[IOSIZE_BUCKET_COUNT];
 	__u64 write_buckets[IOSIZE_BUCKET_COUNT];
+	__u64 read_sum_bytes;
+	__u64 write_sum_bytes;
 };
 
 struct queue_depth {
@@ -112,7 +115,10 @@ struct {
 static __always_inline __u8 parse_op(const char *rwbs) {
 	if (rwbs[0] == 'W')
 		return OP_WRITE;
-	return OP_READ;
+	if (rwbs[0] == 'R')
+		return OP_READ;
+	// Discard ('D'), flush ('F'), and other ops aren't RBD I/O we care about
+	return OP_OTHER;
 }
 
 static __always_inline __u32 log2_u64(__u64 v) {
@@ -164,6 +170,9 @@ int trace_block_rq_issue(struct block_rq_issue_args *ctx) {
 		return 0;
 
 	__u8 op = parse_op(ctx->rwbs);
+	if (op == OP_OTHER)
+		return 0;
+
 	__u32 bytes = ctx->bytes;
 
 	// Track inflight request
@@ -199,10 +208,13 @@ int trace_block_rq_issue(struct block_rq_issue_args *ctx) {
 		__u32 bucket = log2_u64(bytes);
 		if (bucket >= IOSIZE_BUCKET_COUNT)
 			bucket = IOSIZE_BUCKET_COUNT - 1;
-		if (op == OP_WRITE)
+		if (op == OP_WRITE) {
 			__sync_fetch_and_add(&sh->write_buckets[bucket], 1);
-		else
+			__sync_fetch_and_add(&sh->write_sum_bytes, bytes);
+		} else {
 			__sync_fetch_and_add(&sh->read_buckets[bucket], 1);
+			__sync_fetch_and_add(&sh->read_sum_bytes, bytes);
+		}
 	} else {
 		// Use scratch map to avoid stack allocation of iosize_hist (256 bytes)
 		__u32 scratch_idx = 1;
@@ -214,10 +226,13 @@ int trace_block_rq_issue(struct block_rq_issue_args *ctx) {
 		__u32 bucket = log2_u64(bytes);
 		if (bucket >= IOSIZE_BUCKET_COUNT)
 			bucket = IOSIZE_BUCKET_COUNT - 1;
-		if (op == OP_WRITE)
+		if (op == OP_WRITE) {
 			new_sh->write_buckets[bucket] = 1;
-		else
+			new_sh->write_sum_bytes = bytes;
+		} else {
 			new_sh->read_buckets[bucket] = 1;
+			new_sh->read_sum_bytes = bytes;
+		}
 		bpf_map_update_elem(&io_size_dist, &dk, new_sh, BPF_NOEXIST);
 	}
 
