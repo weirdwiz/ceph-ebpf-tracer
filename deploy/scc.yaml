@@ -1,0 +1,29 @@
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: ceph-ebpf-tracer
+allowPrivilegedContainer: true
+allowHostPID: true
+allowHostNetwork: false
+allowHostDirVolumePlugin: true
+allowHostPorts: false
+allowHostIPC: false
+allowedCapabilities: []
+requiredDropCapabilities: []
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+volumes:
+  - hostPath
+  - configMap
+  - secret
+  - projected
+  - downwardAPI
+  - emptyDir
+users:
+  - system:serviceaccount:openshift-storage:ceph-ebpf-tracer

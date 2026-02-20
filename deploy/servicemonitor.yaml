@@ -1,0 +1,35 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ceph-ebpf-tracer
+  namespace: openshift-storage
+  labels:
+    app.kubernetes.io/name: ceph-ebpf-tracer
+spec:
+  namespaceSelector:
+    matchNames:
+      - openshift-storage
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ceph-ebpf-tracer
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ceph-ebpf-tracer
+  namespace: openshift-storage
+  labels:
+    app.kubernetes.io/name: ceph-ebpf-tracer
+spec:
+  selector:
+    app.kubernetes.io/name: ceph-ebpf-tracer
+  ports:
+    - name: metrics
+      port: 9099
+      targetPort: 9099
+      protocol: TCP
+  clusterIP: None

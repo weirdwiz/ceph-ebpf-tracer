@@ -1,0 +1,3 @@
+bin/
+pkg/bpf/tracer_x86_bpfel.go
+pkg/bpf/tracer_x86_bpfel.o

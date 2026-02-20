@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ceph-ebpf-tracer
+  namespace: openshift-storage
+  labels:
+    app.kubernetes.io/name: ceph-ebpf-tracer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ceph-ebpf-tracer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ceph-ebpf-tracer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9099"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ceph-ebpf-tracer
+      hostPID: true
+      nodeSelector:
+        cluster.ocs.openshift.io/openshift-storage: ""
+      tolerations:
+        - key: node.ocs.openshift.io/storage
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: tracer
+          image: quay.io/dkamboj/ceph-ebpf-tracer:latest
+          args:
+            - "--listen=:9099"
+            - "--v=2"
+          ports:
+            - name: metrics
+              containerPort: 9099
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9099
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9099
+            initialDelaySeconds: 5
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: sys
+              mountPath: /sys
+              readOnly: true
+            - name: proc-devices
+              mountPath: /proc/devices
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: sys
+          hostPath:
+            path: /sys
+        - name: proc-devices
+          hostPath:
+            path: /proc/devices

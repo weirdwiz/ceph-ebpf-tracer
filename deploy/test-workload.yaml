@@ -1,0 +1,79 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ebpf-test-pvc
+  namespace: openshift-storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ocs-storagecluster-ceph-rbd
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ebpf-test-fio
+  namespace: openshift-storage
+spec:
+  containers:
+    - name: fio
+      image: quay.io/centos/centos:stream9
+      command:
+        - /bin/bash
+        - -c
+        - |
+          dnf install -y fio 2>&1 | tail -3
+          echo "=== fio randrw test (4K, iodepth=16, 60s) ==="
+          fio --name=randrw \
+              --directory=/data \
+              --rw=randrw \
+              --rwmixread=70 \
+              --bs=4k \
+              --size=256M \
+              --numjobs=2 \
+              --time_based \
+              --runtime=60 \
+              --group_reporting \
+              --direct=1 \
+              --ioengine=libaio \
+              --iodepth=16 \
+              --output-format=terse
+          echo "=== fio seqwrite test (128K, iodepth=4, 30s) ==="
+          fio --name=seqwrite \
+              --directory=/data \
+              --rw=write \
+              --bs=128k \
+              --size=256M \
+              --numjobs=1 \
+              --time_based \
+              --runtime=30 \
+              --group_reporting \
+              --direct=1 \
+              --ioengine=libaio \
+              --iodepth=4 \
+              --output-format=terse
+          echo "=== fio seqread test (128K, iodepth=4, 30s) ==="
+          fio --name=seqread \
+              --directory=/data \
+              --rw=read \
+              --bs=128k \
+              --size=256M \
+              --numjobs=1 \
+              --time_based \
+              --runtime=30 \
+              --group_reporting \
+              --direct=1 \
+              --ioengine=libaio \
+              --iodepth=4 \
+              --output-format=terse
+          echo "=== done ==="
+          sleep 600
+      volumeMounts:
+        - name: test-vol
+          mountPath: /data
+  volumes:
+    - name: test-vol
+      persistentVolumeClaim:
+        claimName: ebpf-test-pvc
