@@ -93,7 +93,7 @@ func main() {
 	cor.Run(ctx)
 
 	// Set up Ceph daemon resolver for network metric filtering
-	res := resolver.New(k8sClient, "openshift-storage")
+	res := resolver.New(k8sClient, "openshift-storage", nodeName)
 	res.Run(ctx)
 
 	// Load and attach network tracer

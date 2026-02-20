@@ -22,6 +22,18 @@ func cephPod(name, app, ip string) *corev1.Pod {
 	}
 }
 
+func clientPod(name, ns, ip, nodeName string, labels map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels:    labels,
+		},
+		Spec:   corev1.PodSpec{NodeName: nodeName},
+		Status: corev1.PodStatus{PodIP: ip},
+	}
+}
+
 func monSvc(name, clusterIP string) *corev1.Service {
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -44,7 +56,7 @@ func TestSyncAllDaemonTypes(t *testing.T) {
 		monSvc("rook-ceph-mon-b", "172.30.188.30"),
 	)
 
-	r := New(client, testNS)
+	r := New(client, testNS, "")
 	if err := r.syncAll(context.Background()); err != nil {
 		t.Fatalf("syncAll: %v", err)
 	}
@@ -79,15 +91,15 @@ func TestSyncAllDaemonTypes(t *testing.T) {
 }
 
 func TestLookupMiss(t *testing.T) {
-	r := New(fake.NewSimpleClientset(), testNS)
+	r := New(fake.NewSimpleClientset(), testNS, "")
 	if info := r.Lookup("1.2.3.4"); info != nil {
 		t.Errorf("Lookup(unknown) = %v, want nil", info)
 	}
 }
 
-func TestRemovePod(t *testing.T) {
+func TestRemoveDaemonPod(t *testing.T) {
 	pod := cephPod("rook-ceph-osd-0-abc-xyz", "rook-ceph-osd", "10.0.0.1")
-	r := New(fake.NewSimpleClientset(pod), testNS)
+	r := New(fake.NewSimpleClientset(pod), testNS, "")
 	r.syncAll(context.Background())
 
 	if r.Lookup("10.0.0.1") == nil {
@@ -95,17 +107,17 @@ func TestRemovePod(t *testing.T) {
 	}
 
 	r.mu.Lock()
-	r.removePod(pod)
+	r.removeDaemonPod(pod)
 	r.mu.Unlock()
 
 	if r.Lookup("10.0.0.1") != nil {
-		t.Error("expected nil after removePod")
+		t.Error("expected nil after removeDaemonPod")
 	}
 }
 
 func TestRemoveSvc(t *testing.T) {
 	svc := monSvc("rook-ceph-mon-a", "172.30.1.1")
-	r := New(fake.NewSimpleClientset(svc), testNS)
+	r := New(fake.NewSimpleClientset(svc), testNS, "")
 	r.syncAll(context.Background())
 
 	if r.Lookup("172.30.1.1") == nil {
@@ -130,7 +142,7 @@ func TestHeadlessSvcSkipped(t *testing.T) {
 		},
 		Spec: corev1.ServiceSpec{ClusterIP: "None"},
 	}
-	r := New(fake.NewSimpleClientset(svc), testNS)
+	r := New(fake.NewSimpleClientset(svc), testNS, "")
 	r.syncAll(context.Background())
 
 	if len(r.byIP) != 0 {
@@ -140,7 +152,7 @@ func TestHeadlessSvcSkipped(t *testing.T) {
 
 func TestPodWithoutIP(t *testing.T) {
 	pod := cephPod("rook-ceph-osd-0-abc-xyz", "rook-ceph-osd", "")
-	r := New(fake.NewSimpleClientset(pod), testNS)
+	r := New(fake.NewSimpleClientset(pod), testNS, "")
 	r.syncAll(context.Background())
 
 	if len(r.byIP) != 0 {
@@ -166,5 +178,97 @@ func TestParseDaemonID(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("parseDaemonID(%q, %q) = %q, want %q", tt.role, tt.name, got, tt.want)
 		}
+	}
+}
+
+func TestLocalPodResolution(t *testing.T) {
+	myNode := "worker-1"
+	client := fake.NewSimpleClientset(
+		// Daemon pod -- should get daemon role, not client
+		cephPod("rook-ceph-osd-0-abc-xyz", "rook-ceph-osd", "10.0.0.1"),
+		// Client pod on our node with app label
+		clientPod("myapp-abc123", "default", "10.0.0.2", myNode, map[string]string{"app": "myapp"}),
+		// Client pod on our node with k8s label
+		clientPod("frontend-xyz", "web", "10.0.0.3", myNode, map[string]string{"app.kubernetes.io/name": "frontend"}),
+		// Client pod on a different node -- should NOT be indexed
+		clientPod("other-pod", "default", "10.0.0.4", "worker-2", map[string]string{"app": "other"}),
+		// Client pod with no labels -- falls back to pod name
+		clientPod("bare-pod", "default", "10.0.0.5", myNode, nil),
+	)
+
+	r := New(client, testNS, myNode)
+	if err := r.syncAll(context.Background()); err != nil {
+		t.Fatalf("syncAll: %v", err)
+	}
+
+	// Daemon pod should have its daemon role
+	info := r.Lookup("10.0.0.1")
+	if info == nil || info.Role != "osd" {
+		t.Errorf("daemon pod: got %v, want role=osd", info)
+	}
+
+	// App-labeled client pod
+	info = r.Lookup("10.0.0.2")
+	if info == nil || info.Role != "client" || info.DaemonID != "myapp" {
+		t.Errorf("myapp pod: got %v, want client/myapp", info)
+	}
+
+	// K8s-labeled client pod
+	info = r.Lookup("10.0.0.3")
+	if info == nil || info.Role != "client" || info.DaemonID != "frontend" {
+		t.Errorf("frontend pod: got %v, want client/frontend", info)
+	}
+
+	// Pod on different node should not be found
+	info = r.Lookup("10.0.0.4")
+	if info != nil {
+		t.Errorf("other-node pod: got %v, want nil", info)
+	}
+
+	// Bare pod falls back to name
+	info = r.Lookup("10.0.0.5")
+	if info == nil || info.Role != "client" || info.DaemonID != "bare-pod" {
+		t.Errorf("bare pod: got %v, want client/bare-pod", info)
+	}
+}
+
+func TestDaemonNotOverwrittenByClient(t *testing.T) {
+	// If a Ceph daemon pod also appears in local pod list, daemon role wins.
+	myNode := "worker-1"
+	osdPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rook-ceph-osd-0-abc-xyz",
+			Namespace: testNS,
+			Labels:    map[string]string{"app": "rook-ceph-osd"},
+		},
+		Spec:   corev1.PodSpec{NodeName: myNode},
+		Status: corev1.PodStatus{PodIP: "10.0.0.1"},
+	}
+
+	r := New(fake.NewSimpleClientset(osdPod), testNS, myNode)
+	r.syncAll(context.Background())
+
+	info := r.Lookup("10.0.0.1")
+	if info == nil || info.Role != "osd" {
+		t.Errorf("daemon should not be overwritten by client, got %v", info)
+	}
+}
+
+func TestHostNetworkPodSkipped(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hostnet-pod",
+			Namespace: "kube-system",
+			Labels:    map[string]string{"app": "hostnet"},
+		},
+		Spec:   corev1.PodSpec{NodeName: "worker-1", HostNetwork: true},
+		Status: corev1.PodStatus{PodIP: "192.168.1.100"},
+	}
+
+	r := New(fake.NewSimpleClientset(pod), testNS, "worker-1")
+	r.syncAll(context.Background())
+
+	if r.Lookup("192.168.1.100") != nil {
+		t.Error("host-network pod should not be indexed")
 	}
 }
