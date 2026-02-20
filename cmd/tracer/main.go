@@ -69,10 +69,25 @@ func main() {
 	cor := correlator.New(k8sClient)
 	cor.Run(ctx)
 
-	// Set up Prometheus collector
+	// Load and attach network tracer
+	netTracer, err := bpfpkg.NewNetTracer()
+	if err != nil {
+		klog.Fatalf("loading net BPF: %v", err)
+	}
+	defer netTracer.Close()
+
+	if err := netTracer.Attach(); err != nil {
+		klog.Fatalf("attaching net BPF: %v", err)
+	}
+
+	// Set up Prometheus collectors
 	maps := tracer.Maps()
 	col := collector.New(dw, cor, maps.IoLatency, maps.IoThroughput, maps.IoSizeDist, maps.IoQueueDepth)
 	prometheus.MustRegister(col)
+
+	netMaps := netTracer.Maps()
+	netCol := collector.NewNetCollector(netMaps.CephConnStats)
+	prometheus.MustRegister(netCol)
 
 	// Serve metrics
 	mux := http.NewServeMux()
